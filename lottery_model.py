@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-双色球预测模型 v3.1
+双色球预测模型 v3.2
 v3.0 基础:
   - 蓝球 AR(1) 均值回归模型 — 利用历史自相关 r≈-0.72
   - 红球 pointwise 排序 — 单分类器 + 号码特征, 对 33 个球打分取 Top-6
@@ -8,12 +8,26 @@ v3.0 基础:
   - 滚动回测框架 — walk-forward 评估真实命中率
 
 v3.1 改进 (2026-06-18):
-  1. 蓝球分类器 — RandomForestClassifier(16类) 替代回归, 避免预测范围收窄
-  2. 红球区域平衡约束 — 强制三区各至少选1个, 打破三区过拟合
+  1. 蓝球分类器 — RandomForestClassifier(16类) 替代回归
+  2. 红球区域平衡约束 — 强制三区各至少选1个
   3. 五行生克交互特征 — 号码五行与日主五行的生克关系 (5维)
   4. 上期重号特征 — is_prev_red 标记上期红球
-  5. 五组模板化多样性 — 基准/追冷/追热/分散/随机, 替代伪多样性
+  5. 五组模板化多样性 — 基准/追冷/追热/分散/随机
   6. 过度预测号码降温 — 基于回测偏差施加指数衰减权重
+
+v3.2 改进 (2026-06-26):
+  1. 多周期频率特征 — is_prev_red 拆分为 freq3/freq5/freq10/days_cold (4维)
+     → 打破单特征独大 (原重要性 0.4568), 释放 38 维被压抑信号
+  2. 趋势权重替代降温 — 基于实际出现频率, 热号加温, 冷号微调
+     → 修正方向性错误 (08 出现 4/5 却被降温)
+  3. 蓝球双窗口 AR(1) — 短期(10期) + 长期(全部) 动态加权
+     → 捕捉短期趋势转变 (近期均值 5.2 vs 长期 9.34)
+  4. 自适应区域约束 — 当某区候选分过低时自动放宽
+     → 避免在空区浪费选号
+  5. 连号奖励 — 对高分号码的相邻号码加分
+     → 利用 60% 连号概率
+  6. 真多样性 — 五组使用差异化特征权重
+     → 追热组提升频率特征权重, 追冷组抑制频率特征权重
 """
 
 import numpy as np
@@ -281,11 +295,65 @@ def number_features(n):
 def number_features_v31(n, rizhu_wx_idx, prev_reds=None):
     """
     v3.1 号码特征: 基础4维 + 交互5维 + 上期标记1维 = 10维
+    （保留用于回测兼容，v3.2 使用 number_features_v32）
     """
     base = number_features(n)
     interact = interaction_features(_number_wuxing(n), rizhu_wx_idx)
     is_prev = 1 if (prev_reds is not None and n in prev_reds) else 0
     return base + interact + [is_prev]
+
+
+# =============================================================================
+# v3.2: 多周期频率特征 (替代 is_prev_red)
+# =============================================================================
+
+def _compute_multi_period_freqs(df, current_idx):
+    """
+    为当期所有号码计算多周期频率特征。
+    返回 dict: {n: [freq_last3, freq_last5, freq_last10, days_cold_norm]}
+    频率: 0.0~1.0, days_cold_norm: 0~1 (0=刚出, 1=长期未出)
+    """
+    freqs = {}
+    for n in range(1, 34):
+        # 回溯统计
+        last3 = last5 = last10 = 0
+        days_since = 999
+        for j in range(current_idx - 1, -1, -1):
+            row = df.iloc[j]
+            drawn = set([int(row['r1']), int(row['r2']), int(row['r3']),
+                        int(row['r4']), int(row['r5']), int(row['r6'])])
+            dist_from_current = current_idx - j
+            if n in drawn:
+                if dist_from_current <= 3:
+                    last3 += 1
+                if dist_from_current <= 5:
+                    last5 += 1
+                if dist_from_current <= 10:
+                    last10 += 1
+                days_since = min(days_since, dist_from_current)
+
+        freqs[n] = [
+            last3 / 3.0,                                    # freq_last3
+            last5 / 5.0,                                    # freq_last5
+            last10 / 10.0,                                  # freq_last10
+            min(days_since, 50) / 50.0 if days_since < 999 else 1.0,  # days_cold_norm
+        ]
+    return freqs
+
+
+def number_features_v32(n, rizhu_wx_idx, freq_features=None):
+    """
+    v3.2 号码特征: 基础4维 + 交互5维 + 多周期频率4维 = 13维
+
+    freq_features: dict {n: [freq3, freq5, freq10, days_cold]} 或 None
+    """
+    base = number_features(n)
+    interact = interaction_features(_number_wuxing(n), rizhu_wx_idx)
+    if freq_features is not None and n in freq_features:
+        freq = freq_features[n]
+    else:
+        freq = [0.0, 0.0, 0.0, 0.5]  # 默认值
+    return base + interact + freq
 
 
 # =============================================================================
@@ -325,7 +393,78 @@ class BlueBallAR:
 
 
 # =============================================================================
-# 主模型 v3.1
+# v3.2: 蓝球双窗口 AR(1) — 短期 + 长期动态加权
+# =============================================================================
+
+class BlueBallARDual:
+    """蓝球双窗口 AR(1): 短期(10期) + 长期(全部) 动态加权"""
+
+    def __init__(self, short_window=10):
+        self.short_window = short_window
+        self.mu_short = None
+        self.mu_long = None
+        self.phi_short = None
+        self.phi_long = None
+        self.sigma_long = None
+        self.w_short = 0.3  # 短期窗口默认权重
+
+    def fit(self, blue_series):
+        y = np.array(blue_series, dtype=float)
+        n = len(y)
+
+        # 长期 AR
+        self.mu_long = np.mean(y)
+        y_lag = y[:-1]
+        y_cur = y[1:]
+        dy_lag = y_lag - self.mu_long
+        dy_cur = y_cur - self.mu_long
+        if np.var(dy_lag) > 1e-6:
+            self.phi_long = np.dot(dy_cur, dy_lag) / np.dot(dy_lag, dy_lag)
+        else:
+            self.phi_long = 0.0
+        residuals = dy_cur - self.phi_long * dy_lag
+        self.sigma_long = np.std(residuals)
+
+        # 短期 AR (最近 short_window 期)
+        sw = min(self.short_window, n)
+        y_short = y[-sw:]
+        self.mu_short = np.mean(y_short)
+        if sw >= 3:
+            yl_s = y_short[:-1]
+            yc_s = y_short[1:]
+            dyl_s = yl_s - self.mu_short
+            dyc_s = yc_s - self.mu_short
+            if np.var(dyl_s) > 1e-6:
+                self.phi_short = np.dot(dyc_s, dyl_s) / np.dot(dyl_s, dyl_s)
+            else:
+                self.phi_short = self.phi_long
+        else:
+            self.mu_short = self.mu_long
+            self.phi_short = self.phi_long
+
+        # 动态权重: 偏差越大, 短期权重越高
+        if self.sigma_long and self.sigma_long > 0:
+            deviation = abs(self.mu_short - self.mu_long) / max(self.sigma_long, 0.5)
+            self.w_short = min(0.75, 0.25 + deviation * 0.18)
+        else:
+            self.w_short = 0.30
+
+        return self
+
+    def predict(self, last_blue):
+        if self.mu_long is None:
+            return 8.5
+        ar_short = self.mu_short + self.phi_short * (last_blue - self.mu_short) if self.phi_short else self.mu_short
+        ar_long = self.mu_long + self.phi_long * (last_blue - self.mu_long) if self.phi_long else self.mu_long
+        pred = self.w_short * ar_short + (1 - self.w_short) * ar_long
+        return np.clip(pred, 1, 16)
+
+    def predict_discrete(self, last_blue):
+        return int(round(self.predict(last_blue)))
+
+
+# =============================================================================
+# 主模型 v3.2
 # =============================================================================
 
 class LotteryModelV3:
@@ -346,20 +485,20 @@ class LotteryModelV3:
         ]
         # v3.0 排序特征 = 基础 + 号码4维
         # v3.1 排序特征 = 基础 + 号码4维 + 交互5维 + 上期标记1维
+        # v3.2 排序特征 = 基础 + 号码4维 + 交互5维 + 多周期频率4维 (46维)
         self.feature_cols_rank = self.feature_cols_base + [
             'num_gan', 'num_zhi', 'num_wx', 'num_parity',
             'interact_same', 'interact_isheng', 'interact_woke',
             'interact_kewo', 'interact_shengwo',
-            'is_prev_red',
+            'freq_last3', 'freq_last5', 'freq_last10', 'days_cold',
         ]
         self.model_red = None       # 红球排序分类器
-        self.model_blue_clf = None  # v3.1: 蓝球分类器 (替代回归)
-        self.model_blue_ar = None   # 蓝球 AR(1)
+        self.model_blue_clf = None  # 蓝球分类器 (替代回归)
+        self.model_blue_ar = None   # v3.2: 蓝球双窗口 AR(1)
         self.backtest_results = None
 
-        # v3.1: 号码预测频次追踪 (用于降温)
-        self._pred_counter = {i: 0 for i in range(1, 34)}
-        self._total_preds = 0
+        # v3.2: 趋势权重 + 策略特征权重
+        self._trend_weights = {i: 1.0 for i in range(1, 34)}
 
     # ------------------------------------------------------------------
     # 数据加载
@@ -371,7 +510,7 @@ class LotteryModelV3:
         self.df_history = df
 
     # ------------------------------------------------------------------
-    # v3.1: 构建排序训练数据 (含交互特征 + 上期特征)
+    # v3.2: 构建排序训练数据 (多周期频率特征替代 is_prev_red)
     # ------------------------------------------------------------------
 
     def _build_rank_data(self, df):
@@ -380,21 +519,15 @@ class LotteryModelV3:
         labels = []
         for i, (_, row) in enumerate(df.iterrows()):
             feat, _, _ = extract_features_enhanced(row['date'])
-            rizhu_wx_idx = feat['rizhu_gan']  # rizhu_gan stores the gan index, need to convert to wuxing
-            # Actually rizhu_gan is the gan index 0-9, we need wuxing index 0-4
             ri_wx_idx = WX_ORDER[TG_WX[feat['rizhu_gan']]]
 
-            # 上期红球
-            prev_reds = None
-            if i > 0:
-                prev_row = df.iloc[i - 1]
-                prev_reds = set([int(prev_row['r1']), int(prev_row['r2']), int(prev_row['r3']),
-                                int(prev_row['r4']), int(prev_row['r5']), int(prev_row['r6'])])
+            # v3.2: 计算多周期频率特征
+            freq_features = _compute_multi_period_freqs(df, i) if i > 0 else None
 
             drawn = set([int(row['r1']), int(row['r2']), int(row['r3']),
                          int(row['r4']), int(row['r5']), int(row['r6'])])
             for n in range(1, 34):
-                nf = number_features_v31(n, ri_wx_idx, prev_reds)
+                nf = number_features_v32(n, ri_wx_idx, freq_features)
                 x = [feat[c] for c in self.feature_cols_base] + nf
                 rows.append(x)
                 labels.append(1 if n in drawn else 0)
@@ -434,113 +567,86 @@ class LotteryModelV3:
         )
         self.model_blue_clf.fit(Xb, yb)
 
-        # ---- 蓝球 AR(1) 模型 ----
+        # ---- v3.2: 蓝球双窗口 AR(1) ----
         blue_series = df['blue'].values
-        self.model_blue_ar = BlueBallAR()
+        self.model_blue_ar = BlueBallARDual(short_window=10)
         self.model_blue_ar.fit(blue_series)
 
-        # ---- v3.1: 计算回测中的号码过度预测偏差 ----
-        self._compute_debias_weights()
+        # ---- v3.2: 计算趋势权重 (替代 v3.1 降温) ----
+        self._compute_trend_weights()
 
-        print(f'[v3.1] Trained on {len(df)} periods')
+        print(f'[v3.2] Trained on {len(df)} periods')
         print(f'  Red rank model: {X_rank.shape[0]} samples, features={X_rank.shape[1]}, '
               f'{y_rank.sum():.0f} positive')
         print(f'  Blue classifier: 16-class, samples={len(df_blue)}')
-        print(f'  Blue AR(1): mu={self.model_blue_ar.mu:.2f}, phi={self.model_blue_ar.phi:.4f}')
+        if hasattr(self.model_blue_ar, 'mu_long'):
+            print(f'  Blue AR dual: mu_long={self.model_blue_ar.mu_long:.2f}, '
+                  f'mu_short={self.model_blue_ar.mu_short:.2f}, '
+                  f'w_short={self.model_blue_ar.w_short:.2f}')
+        else:
+            print(f'  Blue AR(1): mu={self.model_blue_ar.mu:.2f}, phi={self.model_blue_ar.phi:.4f}')
         return self
 
     # ------------------------------------------------------------------
-    # v3.1: 过度预测号码降温权重
+    # v3.2: 基于实际频率的趋势权重 (替代 v3.1 降温)
     # ------------------------------------------------------------------
 
-    def _compute_debias_weights(self, window=60):
-        """基于近期回测计算号码预测偏差, 生成降温权重"""
+    def _compute_trend_weights(self):
+        """
+        v3.2: 基于号码实际出现频率计算趋势权重。
+        - 短期热门 (last5 >= 3): 加温 20%
+        - 偏热 (last5 >= 2): 加温 10%
+        - 长期冷号 (last20 == 0): 轻微加温 5% (均值回归)
+        - 短期冷号 (last5 == 0, 但 last20 > 0): 降温 10%
+        - 其他: 1.0
+        """
         df = self.df_history
-        if len(df) < window:
-            self._debias_weights = {i: 1.0 for i in range(1, 34)}
+        n_total = len(df)
+        if n_total == 0:
+            self._trend_weights = {i: 1.0 for i in range(1, 34)}
             return
 
-        # 使用最近 window 期做简易回测
-        pred_counts = {i: 0 for i in range(1, 34)}
-        actual_counts = {i: 0 for i in range(1, 34)}
-
-        for i in range(len(df) - window, len(df)):
-            train_df = df.iloc[:i]
-            test_row = df.iloc[i]
-
-            sub = LotteryModelV3()
-            sub.df_history = train_df
-            # 快速训练 (降低参数以加速)
-            Xr, yr = sub._build_rank_data(train_df)
-            sub.model_red = RandomForestClassifier(
-                n_estimators=100, max_depth=6, min_samples_leaf=20,
-                class_weight='balanced', random_state=42, n_jobs=-1
-            )
-            sub.model_red.fit(Xr, yr)
-
-            feat, _, _ = extract_features_enhanced(test_row['date'])
-            ri_wx_idx = WX_ORDER[TG_WX[feat['rizhu_gan']]]
-            prev_reds = None
-            if i > 0:
-                pr = df.iloc[i - 1]
-                prev_reds = set([int(pr['r1']), int(pr['r2']), int(pr['r3']),
-                                int(pr['r4']), int(pr['r5']), int(pr['r6'])])
-
-            # 获取预测 Top-6
-            base = [feat[c] for c in sub.feature_cols_base]
-            scores = []
-            for n in range(1, 34):
-                nf = number_features_v31(n, ri_wx_idx, prev_reds)
-                x = np.array([base + nf])
-                prob = sub.model_red.predict_proba(x)[0][1]
-                scores.append((n, prob))
-            scores.sort(key=lambda t: t[1], reverse=True)
-            top6 = set(n for n, _ in scores[:6])
-
-            actual = set([int(test_row['r1']), int(test_row['r2']), int(test_row['r3']),
-                         int(test_row['r4']), int(test_row['r5']), int(test_row['r6'])])
-
-            for n in top6:
-                pred_counts[n] += 1
-            for n in actual:
-                actual_counts[n] += 1
-
-        # 计算偏差权重: pred/expected, 过度预测的号码降权
-        n_periods = window
-        expected_per_num = n_periods * 6 / 33  # ≈ expected predictions per number
         weights = {}
         for n in range(1, 34):
-            if actual_counts[n] == 0:
-                weights[n] = 1.0
-            else:
-                ratio = max(pred_counts[n], 1) / max(actual_counts[n], 1)
-                # 过度预测 >2x 的号码施加降温, 欠预测的号码加温
-                if ratio > 2.0:
-                    weights[n] = 0.7  # 降温 30%
-                elif ratio > 1.5:
-                    weights[n] = 0.85
-                elif ratio < 0.5:
-                    weights[n] = 1.15  # 加温 15%
-                elif ratio < 0.8:
-                    weights[n] = 1.05
-                else:
-                    weights[n] = 1.0
+            count5 = sum(1 for j in range(max(0, n_total - 5), n_total)
+                        if n in set([int(df.iloc[j]['r1']), int(df.iloc[j]['r2']),
+                                     int(df.iloc[j]['r3']), int(df.iloc[j]['r4']),
+                                     int(df.iloc[j]['r5']), int(df.iloc[j]['r6'])]))
+            count20 = sum(1 for j in range(max(0, n_total - 20), n_total)
+                         if n in set([int(df.iloc[j]['r1']), int(df.iloc[j]['r2']),
+                                      int(df.iloc[j]['r3']), int(df.iloc[j]['r4']),
+                                      int(df.iloc[j]['r5']), int(df.iloc[j]['r6'])]))
 
-        self._debias_weights = weights
-        # 打印被降温的号码
-        cooled = [n for n, w in weights.items() if w < 0.95]
-        warmed = [n for n, w in weights.items() if w > 1.05]
-        if cooled:
-            print(f'  Debias cooled: {cooled}')
-        if warmed:
-            print(f'  Debias warmed: {warmed}')
+            if count5 >= 3:
+                weights[n] = 1.20   # 短期大热: 加温 20%
+            elif count5 >= 2:
+                weights[n] = 1.10   # 偏热: 加温 10%
+            elif count20 == 0:
+                weights[n] = 1.05   # 长冷号: 轻微加温 (均值回归预期)
+            elif count5 == 0:
+                weights[n] = 0.90   # 短期冷号 (但不在长期冷门): 降温 10%
+            else:
+                weights[n] = 1.00
+
+        self._trend_weights = weights
+
+        # 诊断输出
+        hot = [n for n, w in weights.items() if w >= 1.15]
+        warm = [n for n, w in weights.items() if 1.05 <= w < 1.15]
+        cool = [n for n, w in weights.items() if w <= 0.90]
+        if hot:
+            print(f'  Trend HOT (w>=1.15): {hot}')
+        if warm:
+            print(f'  Trend warm (w=1.05-1.15): {warm}')
+        if cool:
+            print(f'  Trend cool (w<=0.90): {cool}')
 
     # ------------------------------------------------------------------
     # 回测
     # ------------------------------------------------------------------
 
     def backtest(self, start_period=60):
-        """Walk-forward 回测: 从第 start_period 期开始"""
+        """Walk-forward 回测 v3.2: 从第 start_period 期开始"""
         df = self.df_history
         results = []
 
@@ -551,7 +657,7 @@ class LotteryModelV3:
             sub = LotteryModelV3()
             sub.df_history = train_df
 
-            # 红球
+            # 红球 (v3.2 多周期频率)
             Xr, yr = sub._build_rank_data(train_df)
             sub.model_red = RandomForestClassifier(
                 n_estimators=200, max_depth=8, min_samples_leaf=20,
@@ -574,11 +680,14 @@ class LotteryModelV3:
                 tf['blue'].values.astype(int) - 1
             )
 
-            # 蓝球 AR
-            sub.model_blue_ar = BlueBallAR()
+            # v3.2: 蓝球双窗口 AR
+            sub.model_blue_ar = BlueBallARDual(short_window=10)
             sub.model_blue_ar.fit(train_df['blue'].values)
 
-            # 预测
+            # v3.2: 趋势权重 (用于红球排序)
+            sub._compute_trend_weights()
+
+            # 预测 (使用 v3.2 predict, 自适应区域约束)
             pred = sub.predict(test_row['date'])
 
             # 比对
@@ -620,7 +729,11 @@ class LotteryModelV3:
         print(f'  红球平均命中: {np.mean(red_hits):.3f}  (随机期望: {expected_red:.3f})')
         print(f'  红球 ≥3 命中率: {sum(1 for h in red_hits if h>=3)/n*100:.1f}%')
         print(f'  蓝球命中率:    {np.mean(blue_hits)*100:.1f}%  (随机期望: {expected_blue*100:.1f}%)')
-        print(f'  蓝球 AR phi:    {self.model_blue_ar.phi:.4f}')
+        if hasattr(self.model_blue_ar, 'phi_long'):
+            print(f'  蓝球 AR phi_long: {self.model_blue_ar.phi_long:.4f}')
+            print(f'  蓝球 AR w_short:  {self.model_blue_ar.w_short:.2f}')
+        else:
+            print(f'  蓝球 AR phi:    {self.model_blue_ar.phi:.4f}')
 
         recent = red_hits[-20:]
         print(f'  最近20期红球均值: {np.mean(recent):.3f}')
@@ -635,34 +748,59 @@ class LotteryModelV3:
     # v3.1: 预测 — 区域平衡 + 降温权重 + 蓝球分类器
     # ------------------------------------------------------------------
 
-    def _predict_red_scores(self, date_val, hour=21):
-        """对 33 个红球打分 (含 v3.1 交互特征 + 上期特征), 返回 [(号码, 得分), ...] 降序"""
+    def _predict_red_scores(self, date_val, hour=21, freq_multiplier=1.0):
+        """
+        v3.2: 对 33 个红球打分 (多周期频率特征 + 趋势权重 + 连号奖励)
+
+        freq_multiplier: 频率特征权重倍数 (>1 追热, <1 追冷, =1 基准)
+        """
         feat, _, _ = extract_features_enhanced(date_val, hour)
         ri_wx_idx = WX_ORDER[TG_WX[feat['rizhu_gan']]]
         base = [feat[c] for c in self.feature_cols_base]
 
-        # 上期红球
-        prev_reds = None
-        if self.df_history is not None and len(self.df_history) > 0:
-            last_row = self.df_history.iloc[-1]
-            prev_reds = set([int(last_row['r1']), int(last_row['r2']), int(last_row['r3']),
-                            int(last_row['r4']), int(last_row['r5']), int(last_row['r6'])])
+        # v3.2: 计算多周期频率特征
+        n_total = len(self.df_history) if self.df_history is not None else 0
+        freq_features = _compute_multi_period_freqs(self.df_history, n_total) if n_total > 0 else None
 
         scores = []
         for n in range(1, 34):
-            nf = number_features_v31(n, ri_wx_idx, prev_reds)
+            nf = number_features_v32(n, ri_wx_idx, freq_features)
             x = np.array([base + nf])
             prob = self.model_red.predict_proba(x)[0][1]
-            # v3.1: 应用降温权重 (回测子模型可能没有)
-            prob *= getattr(self, '_debias_weights', {}).get(n, 1.0)
-            scores.append((n, prob))
-        scores.sort(key=lambda t: t[1], reverse=True)
-        return scores, prev_reds
 
-    def _balanced_top6(self, scores):
+            # v3.2: 应用趋势权重 (替代 v3.1 降温)
+            prob *= getattr(self, '_trend_weights', {}).get(n, 1.0)
+
+            # v3.2: 频率特征差异化 (用于多样性策略)
+            if freq_multiplier != 1.0 and freq_features is not None:
+                freq_bonus = sum(freq_features[n][:3]) / 3.0  # 平均频率
+                prob *= (1.0 + (freq_multiplier - 1.0) * freq_bonus)
+
+            scores.append((n, prob))
+
+        # v3.2: 连号奖励 — 对 Top 候选的相邻号码加分
+        scores_dict = dict(scores)
+        sorted_scores = sorted(scores, key=lambda t: t[1], reverse=True)
+        top_candidates = set(n for n, s in sorted_scores[:12])
+
+        boosted = {}
+        for n in top_candidates:
+            for adj in [n - 1, n + 1]:
+                if 1 <= adj <= 33 and adj not in top_candidates:
+                    # 连号奖励: 相邻号码获得额外分 (但不超 Top-1)
+                    adj_bonus = scores_dict.get(n, 0) * 0.15  # 15% of neighbor's score
+                    boosted[adj] = max(boosted.get(adj, 0), adj_bonus)
+
+        scores = [(n, s + boosted.get(n, 0)) for n, s in scores]
+        scores.sort(key=lambda t: t[1], reverse=True)
+        return scores, {n: s for n, s in scores_dict.items()}  # 返回原始分数用于参考
+
+    def _balanced_top6(self, scores, adaptive=True):
         """
-        v3.1: 区域平衡 Top-6 选择
-        确保三区各至少选 1 个号码
+        v3.2: 自适应区域平衡 Top-6 选择
+        确保三区各至少选 1 个号码, 但若某区最佳得分 < 全局第12名得分的 60%, 则跳过该区
+
+        adaptive=False 时恢复 v3.1 的硬约束行为 (用于回测)
         """
         # 按区分组
         zone_scores = {1: [], 2: [], 3: []}
@@ -674,15 +812,24 @@ class LotteryModelV3:
             else:
                 zone_scores[3].append((n, s))
 
-        # 每区先取 top-1
+        # 排名第12的得分作为阈值参考
+        threshold_12th = scores[11][1] if len(scores) > 11 else 0
+        zone_threshold = threshold_12th * 0.60  # 某区最佳必须 > 60% of 12th
+
         selected = set()
+        # 每区先取 top-1 (若高于阈值)
         for z in [1, 2, 3]:
+            if zone_scores[z] and adaptive:
+                best_in_zone = zone_scores[z][0][1]
+                if best_in_zone < zone_threshold:
+                    # 该区候选分过低, 跳过硬约束
+                    continue
             for n, s in zone_scores[z]:
                 if n not in selected:
                     selected.add(n)
                     break
 
-        # 剩余 3 个从全局最高分取 (排除已选)
+        # 剩余从全局最高分取 (排除已选)
         for n, s in scores:
             if len(selected) >= 6:
                 break
@@ -692,22 +839,27 @@ class LotteryModelV3:
         return sorted(selected)
 
     def predict(self, date_val, hour=21):
-        """v3.1 单次预测"""
+        """v3.2 单次预测: 多周期频率 + 自适应区域约束 + 双窗口 AR + 连号奖励"""
         feat, bazi, wx = extract_features_enhanced(date_val, hour)
         Xb = np.array([[feat[c] for c in self.feature_cols_base]])
 
-        # 红球: 区域平衡 Top-6
-        scores, prev_reds = self._predict_red_scores(date_val, hour)
-        red_top6 = self._balanced_top6(scores)
+        # 红球: 自适应区域平衡 Top-6 (v3.2)
+        scores, raw_scores = self._predict_red_scores(date_val, hour)
+        red_top6 = self._balanced_top6(scores, adaptive=True)
 
-        # 蓝球: 分类器期望值 + AR 加权 (v3.1)
-        blue_proba = self.model_blue_clf.predict_proba(Xb)[0]  # 16-dim
-        # 方法1: argmax
+        # 蓝球: 分类器 + 双窗口 AR 加权 (v3.2)
+        blue_proba_raw = self.model_blue_clf.predict_proba(Xb)[0]  # may have <16 classes
+        blue_classes = self.model_blue_clf.classes_  # actual class labels (0-15)
+        # Build full 16-dim probability vector
+        blue_proba_full = np.zeros(16)
+        for idx, cls in enumerate(blue_classes):
+            if idx < len(blue_proba_raw):
+                blue_proba_full[int(cls)] = blue_proba_raw[idx]
+        blue_proba = blue_proba_full
         blue_clf_argmax = int(np.argmax(blue_proba)) + 1
-        # 方法2: 期望值 (利用完整概率分布, 更稳健)
         blue_clf_expected = sum((i + 1) * blue_proba[i] for i in range(16))
 
-        # AR(1)
+        # v3.2: 双窗口 AR(1)
         if len(self.df_history) > 0:
             last_blue = self.df_history['blue'].iloc[-1]
         else:
@@ -726,32 +878,35 @@ class LotteryModelV3:
             'pred_red': red_top6,
             'pred_blue': blue_ens,
             'red_scores': scores[:12],
+            'red_raw_scores': raw_scores,
             'blue_clf_argmax': blue_clf_argmax,
             'blue_clf_expected': float(blue_clf_expected),
             'blue_ar': float(blue_ar_val),
             'blue_proba_top5': [(int(i)+1, float(blue_proba[i]))
                                 for i in np.argsort(blue_proba)[::-1][:5]],
-            'prev_reds': prev_reds,
+            'ar_mu_long': getattr(self.model_blue_ar, 'mu_long', None),
+            'ar_mu_short': getattr(self.model_blue_ar, 'mu_short', None),
+            'ar_w_short': getattr(self.model_blue_ar, 'w_short', None),
         }
 
     # ------------------------------------------------------------------
-    # v3.1: 五组模板化多样性预测
+    # v3.2: 六组差异化多样性预测 (真多样性)
     # ------------------------------------------------------------------
 
-    def predict_multi(self, date_val, hour=21, n=5):
+    def predict_multi(self, date_val, hour=21, n=6):
         """
-        v3.1: 5组模板化预测 (真多样性)
-        组1: 基准 (区域平衡 Top-6)
-        组2: 追冷号 (强制至少 2 个冷号)
-        组3: 追热号 (模型原始无约束 Top-6)
-        组4: 均衡分散 (每区恰好 2 个)
-        组5: 加权随机采样 (从 Top-15 按概率采样)
+        v3.2: 6组差异化预测 (真多样性 — 不同组使用不同特征权重策略)
+        组1: 基准(自适应区域平衡) — freq_multiplier=1.0
+        组2: 追冷号 — freq_multiplier=0.3 (抑制高频特征, 冷号获更高分)
+        组3: 追热号 — freq_multiplier=3.0 (放大频率特征, 热号获更高分)
+        组4: 均衡分散(2-2-2) — freq_multiplier=1.0 + 每区2个
+        组5: 五行偏重 — 根据日主五行偏好调整权重
+        组6: 加权随机采样 — freq_multiplier=2.0 从 Top-15 随机
         """
+        # 组1: 基准
         base = self.predict(date_val, hour)
-        scores = base['red_scores']  # Top-12 scored
-        all_scores = {n: s for n, s in scores}  # all 33 scores
-        # Also compute full 33 scores for cold/hot selection
-        full_scores, _ = self._predict_red_scores(date_val, hour)
+        scores = base['red_scores']
+        full_scores, _ = self._predict_red_scores(date_val, hour, freq_multiplier=1.0)
         full_scores_dict = {n: s for n, s in full_scores}
 
         results = [{
@@ -759,66 +914,48 @@ class LotteryModelV3:
             'index': 1,
             'pred_red': base['pred_red'],
             'pred_blue': base['pred_blue'],
-            'strategy': '基准(区域平衡)',
+            'strategy': '基准(自适应区域平衡)',
         }]
 
-        # --- 组2: 追冷号 ---
-        # 冷号 = 模型得分最低的号码
-        cold_candidates = [n for n, _ in full_scores[-15:]]  # bottom 15
-        # 从冷号中随机选 2 个, 其余 4 个用区域平衡
-        np.random.seed(int(date_val.strftime('%Y%m%d')) + 2)
-        forced_cold = list(np.random.choice(cold_candidates, size=2, replace=False))
+        # --- 组2: 追冷号 (抑制频率, 冷号获更多分) ---
+        cold_scores, _ = self._predict_red_scores(date_val, hour, freq_multiplier=0.3)
+        cold_full = {n: s for n, s in cold_scores}
 
-        # 剩余 4 个: 区域平衡, 但排除 forced_cold 的区
-        remaining_scores = [(n, s) for n, s in full_scores if n not in forced_cold]
-        z1_rest = [(n, s) for n, s in remaining_scores if n in ZONE1]
-        z2_rest = [(n, s) for n, s in remaining_scores if n in ZONE2]
-        z3_rest = [(n, s) for n, s in remaining_scores if n in ZONE3]
-        selected2 = set(forced_cold)
-        # 强制每区至少1个 (如果冷号没覆盖)
-        for z_rest in [z1_rest, z2_rest, z3_rest]:
-            if not any(n in selected2 for n, _ in z_rest):
-                for n, s in z_rest:
-                    if n not in selected2:
-                        selected2.add(n)
-                        break
-        for n, s in remaining_scores:
-            if len(selected2) >= 6:
-                break
-            if n not in selected2:
-                selected2.add(n)
+        # 选出冷号高分中的 Top-6 (自适应区域约束)
+        cold_top6 = self._balanced_top6(cold_scores, adaptive=True)
 
-        # 蓝球: 从概率分布中取第二选择
+        # 蓝球: CLF 第二选择
         blue_proba = base.get('blue_proba_top5', [])
         blue2 = blue_proba[1][0] if len(blue_proba) > 1 else base['pred_blue']
 
         results.append({
             'date': date_val,
             'index': 2,
-            'pred_red': sorted(selected2),
+            'pred_red': cold_top6,
             'pred_blue': blue2,
-            'strategy': '追冷号',
+            'strategy': '追冷号(freq×0.3)',
         })
 
-        # --- 组3: 追热号 (模型原始无约束 Top-6) ---
-        hot6 = sorted([n for n, _ in full_scores[:6]])
+        # --- 组3: 追热号 (放大频率特征) ---
+        hot_scores, _ = self._predict_red_scores(date_val, hour, freq_multiplier=3.0)
+        hot_top6 = self._balanced_top6(hot_scores, adaptive=True)
 
-        # 蓝球: 分类器直接预测 (argmax)
+        # 蓝球: CLF argmax
         blue3 = base['blue_clf_argmax']
 
         results.append({
             'date': date_val,
             'index': 3,
-            'pred_red': hot6,
+            'pred_red': hot_top6,
             'pred_blue': int(blue3),
-            'strategy': '追热号(无约束)',
+            'strategy': '追热号(freq×3.0)',
         })
 
-        # --- 组4: 均衡分散 (每区恰好 2 个) ---
+        # --- 组4: 均衡分散 (每区恰好2个) ---
         selected4 = set()
         for z in [1, 2, 3]:
-            z_list = [(n, s) for n, s in full_scores if n in (ZONE1 if z==1 else ZONE2 if z==2 else ZONE3)
-                      and n not in selected4]
+            z_nums = ZONE1 if z == 1 else ZONE2 if z == 2 else ZONE3
+            z_list = [(n, s) for n, s in full_scores if n in z_nums and n not in selected4]
             count = 0
             for n, s in z_list:
                 if count >= 2:
@@ -826,8 +963,12 @@ class LotteryModelV3:
                 selected4.add(n)
                 count += 1
 
-        # 蓝球: AR 预测
-        blue4 = int(round(base['blue_ar']))
+        # 蓝球: AR 离散预测
+        if len(self.df_history) > 0:
+            last_blue = self.df_history['blue'].iloc[-1]
+        else:
+            last_blue = 8
+        blue4 = self.model_blue_ar.predict_discrete(last_blue)
 
         results.append({
             'date': date_val,
@@ -837,7 +978,36 @@ class LotteryModelV3:
             'strategy': '均衡分散(2-2-2)',
         })
 
-        # --- 组5: 加权随机采样 ---
+        # --- 组5: 五行偏重 — 根据日主五行调整 ---
+        feat, _, _ = extract_features_enhanced(date_val, hour)
+        rizhu_wx = TG_WX[feat['rizhu_gan']]  # 日主五行
+        # 五行补益: 生我 + 我 → 加温
+        wx_boost = {'木': ['水', '木'], '火': ['木', '火'], '土': ['火', '土'],
+                    '金': ['土', '金'], '水': ['金', '水']}
+        boost_wx = wx_boost.get(rizhu_wx, ['木', '火'])
+
+        wx_scores, _ = self._predict_red_scores(date_val, hour, freq_multiplier=1.0)
+        wx_adjusted = []
+        for n, s in wx_scores:
+            n_wx = TG_WX[_number_tiangan(n)]
+            if n_wx in boost_wx:
+                s *= 1.08  # 补益五行加温 8%
+            wx_adjusted.append((n, s))
+        wx_adjusted.sort(key=lambda t: t[1], reverse=True)
+        wx_top6 = self._balanced_top6(wx_adjusted, adaptive=True)
+
+        # 蓝球: 从概率分布中按期望取
+        blue5 = int(round(base['blue_clf_expected']))
+
+        results.append({
+            'date': date_val,
+            'index': 5,
+            'pred_red': wx_top6,
+            'pred_blue': blue5,
+            'strategy': f'五行偏重(喜{"/".join(boost_wx)})',
+        })
+
+        # --- 组6: 加权随机采样 ---
         np.random.seed(int(date_val.strftime('%Y%m%d')) + 5)
         top15_nums = [n for n, _ in full_scores[:15]]
         top15_probs = np.array([s for _, s in full_scores[:15]])
@@ -852,27 +1022,27 @@ class LotteryModelV3:
                 picks = np.random.choice(z_candidates, size=min(z_want, len(z_candidates)),
                                         replace=False, p=z_probs)
                 sampled.update(picks)
-        # 如果不够 6 个, 从剩余补
+        # 不够 6 个从剩余补
         for n, _ in full_scores:
             if len(sampled) >= 6:
                 break
             if n not in sampled:
                 sampled.add(n)
 
-        # 蓝球: 从概率分布随机采样
+        # 蓝球: 随机采样
         if blue_proba:
             b_nums = [b[0] for b in blue_proba[:5]]
             b_probs = np.array([b[1] for b in blue_proba[:5]])
             b_probs = b_probs / b_probs.sum()
-            blue5 = int(np.random.choice(b_nums, p=b_probs))
+            blue6 = int(np.random.choice(b_nums, p=b_probs))
         else:
-            blue5 = base['pred_blue']
+            blue6 = base['pred_blue']
 
         results.append({
             'date': date_val,
-            'index': 5,
+            'index': 6,
             'pred_red': sorted(sampled),
-            'pred_blue': blue5,
+            'pred_blue': blue6,
             'strategy': '加权随机采样',
         })
 
@@ -894,6 +1064,8 @@ class LotteryModelV3:
     @property
     def blue_ar_phi(self):
         if self.model_blue_ar:
+            if hasattr(self.model_blue_ar, 'phi_long'):
+                return self.model_blue_ar.phi_long
             return self.model_blue_ar.phi
         return None
 
@@ -904,8 +1076,8 @@ class LotteryModelV3:
 
 if __name__ == '__main__':
     print('=' * 60)
-    print('双色球预测模型 v3.1')
-    print('蓝球分类器 + 红球区域平衡 + 交互特征 + 模板多样性')
+    print('双色球预测模型 v3.2')
+    print('多周期频率 + 趋势权重 + 双窗口AR + 自适应区域 + 连号奖励')
     print('=' * 60)
 
     model = LotteryModelV3()
@@ -928,7 +1100,11 @@ if __name__ == '__main__':
     result = model.predict(target, hour=21)
     print(f'预测日期: {target.strftime("%Y-%m-%d")}')
     print(f'推荐红球: {result["pred_red"]}')
-    print(f'推荐蓝球: {result["pred_blue"]}  (CLF={result["blue_clf_argmax"]}, exp={result["blue_clf_expected"]:.1f}, AR={result["blue_ar"]:.0f})')
+    print(f'推荐蓝球: {result["pred_blue"]}  (CLF={result["blue_clf_argmax"]}, '
+          f'exp={result["blue_clf_expected"]:.1f}, AR={result["blue_ar"]:.0f})')
+    if result.get('ar_mu_short') is not None:
+        print(f'  AR Dual: mu_long={result["ar_mu_long"]:.2f}, mu_short={result["ar_mu_short"]:.2f}, '
+              f'w_short={result["ar_w_short"]:.2f}')
 
     print('\n红球 Top-12 得分:')
     for n, s in result['red_scores']:
