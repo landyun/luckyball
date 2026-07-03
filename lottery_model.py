@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-双色球预测模型 v3.2
+双色球预测模型 v3.3 — 冷热双策略架构
 v3.0 基础:
   - 蓝球 AR(1) 均值回归模型 — 利用历史自相关 r≈-0.72
   - 红球 pointwise 排序 — 单分类器 + 号码特征, 对 33 个球打分取 Top-6
@@ -16,18 +16,15 @@ v3.1 改进 (2026-06-18):
   6. 过度预测号码降温 — 基于回测偏差施加指数衰减权重
 
 v3.2 改进 (2026-06-26):
-  1. 多周期频率特征 — is_prev_red 拆分为 freq3/freq5/freq10/days_cold (4维)
-     → 打破单特征独大 (原重要性 0.4568), 释放 38 维被压抑信号
-  2. 趋势权重替代降温 — 基于实际出现频率, 热号加温, 冷号微调
-     → 修正方向性错误 (08 出现 4/5 却被降温)
-  3. 蓝球双窗口 AR(1) — 短期(10期) + 长期(全部) 动态加权
-     → 捕捉短期趋势转变 (近期均值 5.2 vs 长期 9.34)
-  4. 自适应区域约束 — 当某区候选分过低时自动放宽
-     → 避免在空区浪费选号
-  5. 连号奖励 — 对高分号码的相邻号码加分
-     → 利用 60% 连号概率
-  6. 真多样性 — 五组使用差异化特征权重
-     → 追热组提升频率特征权重, 追冷组抑制频率特征权重
+  1-6. (多周期频率、趋势权重、双窗口AR、自适应区域、连号奖励、真多样性)
+
+v3.3 改进 (2026-07-03):
+  1. 冷热双策略架构 — 每次预测同时输出两种相反策略
+  2. 冷号追踪策略 (ML) — RF模型追冷号回补 (4组: C1-C4)
+  3. 热号动量策略 (频率) — 纯频率统计追热号延续 (4组: H1-H4)
+     H1-H3 完全不使用 ML, 从根本上打破 84% 频率特征垄断
+  4. 通用分区选号器 — _zone_pick_from_scored() 替代散落的分区逻辑
+  5. 策略对比追踪 — 记忆文件记录冷/热策略各自命中率, 积累实证数据
 """
 
 import numpy as np
@@ -357,6 +354,140 @@ def number_features_v32(n, rizhu_wx_idx, freq_features=None):
 
 
 # =============================================================================
+# v3.3: 通用频率统计 & 热度评分 helpers
+# =============================================================================
+
+def _compute_number_frequency_counts(df):
+    """
+    对所有 33 个号码计算多窗口出现频率和距上次出现期数。
+    纯统计计算，不依赖 ML 模型。
+
+    Returns:
+        dict: {n: {'count3': int, 'count5': int, 'count10': int, 'count20': int,
+                   'days_since': int, 'is_consecutive': bool}}
+    """
+    n_total = len(df)
+    freq = {}
+    for n in range(1, 34):
+        count3 = count5 = count10 = count20 = 0
+        days_since = 999
+
+        for j in range(n_total - 1, -1, -1):
+            row = df.iloc[j]
+            drawn = set([int(row['r1']), int(row['r2']), int(row['r3']),
+                        int(row['r4']), int(row['r5']), int(row['r6'])])
+            dist_from_current = n_total - 1 - j
+            if n in drawn:
+                if dist_from_current <= 3:
+                    count3 += 1
+                if dist_from_current <= 5:
+                    count5 += 1
+                if dist_from_current <= 10:
+                    count10 += 1
+                if dist_from_current <= 20:
+                    count20 += 1
+                days_since = min(days_since, dist_from_current)
+
+        freq[n] = {
+            'count3': count3,
+            'count5': count5,
+            'count10': count10,
+            'count20': count20,
+            'days_since': days_since if days_since < 999 else 999,
+            'is_consecutive': (days_since == 0),
+        }
+    return freq
+
+
+def _compute_hot_momentum_scores(freq_counts, variant='default'):
+    """
+    纯频率热度评分 — 完全不用 ML 模型。
+
+    variant:
+      - 'default': count3*3.0 + count5*1.5 + count10*0.5 (标准)
+      - 'surge':    count3*5.0 + count5*1.0           (近3期权重×5)
+      - 'balanced': count3*2.0 + count5*1.5 + count10*1.0 + count20*0.3 (均衡)
+
+    惩罚: days_since > 30 → 得分 × 0.5
+
+    Returns:
+        list of (number, score) sorted descending
+    """
+    weights = {
+        'default':  {'c3': 3.0, 'c5': 1.5, 'c10': 0.5, 'c20': 0.0},
+        'surge':    {'c3': 5.0, 'c5': 1.0, 'c10': 0.0, 'c20': 0.0},
+        'balanced': {'c3': 2.0, 'c5': 1.5, 'c10': 1.0, 'c20': 0.3},
+    }
+    w = weights.get(variant, weights['default'])
+
+    scores = []
+    for n in range(1, 34):
+        fc = freq_counts[n]
+        score = (fc['count3'] * w['c3'] + fc['count5'] * w['c5'] +
+                 fc['count10'] * w['c10'] + fc['count20'] * w['c20'])
+        # 长期冷号惩罚
+        if fc['days_since'] > 30:
+            score *= 0.5
+        scores.append((n, score))
+
+    scores.sort(key=lambda t: t[1], reverse=True)
+    return scores
+
+
+def _zone_pick_from_scored(scored_list, picks_per_zone=(2, 2, 2),
+                           adaptive=False, n_total=6,
+                           zone_threshold_ratio=0.50):
+    """
+    通用分区选号器：从排序列表中按分区约束选取 Top-n。
+
+    Args:
+        scored_list: [(number, score), ...] 已排序
+        picks_per_zone: e.g. (2,2,2)=每区2个; (1,1,1)=每区至少1个
+        adaptive: 若 True, 某区最佳分 < 全局第n_total名 × zone_threshold_ratio 时跳过硬约束
+        n_total: 总共选取的数量
+        zone_threshold_ratio: 自适应跳过的阈值比例 (默认 0.50)
+
+    Returns:
+        sorted list of selected numbers
+    """
+    zone_nums = {1: ZONE1, 2: ZONE2, 3: ZONE3}
+    scored_dict = dict(scored_list)
+    selected = set()
+
+    # 自适应阈值
+    threshold = 0.0
+    if adaptive and len(scored_list) >= n_total:
+        nth_score = scored_list[n_total - 1][1]
+        threshold = nth_score * zone_threshold_ratio
+
+    for z in [1, 2, 3]:
+        want = picks_per_zone[z - 1]
+        if want == 0:
+            continue
+        z_list = [(n, scored_dict.get(n, 0)) for n in zone_nums[z] if n not in selected]
+        z_list.sort(key=lambda t: t[1], reverse=True)
+        if adaptive and z_list and z_list[0][1] < threshold:
+            # 该区候选分过低, 跳过配额
+            continue
+        count = 0
+        for n, s in z_list:
+            if count >= want:
+                break
+            if n not in selected:
+                selected.add(n)
+                count += 1
+
+    # 不足 n_total 从全局补
+    for n, s in scored_list:
+        if len(selected) >= n_total:
+            break
+        if n not in selected:
+            selected.add(n)
+
+    return sorted(selected)
+
+
+# =============================================================================
 # 蓝球 AR(1) 均值回归模型
 # =============================================================================
 
@@ -464,11 +595,11 @@ class BlueBallARDual:
 
 
 # =============================================================================
-# 主模型 v3.2
+# 主模型 v3.3 — 冷热双策略
 # =============================================================================
 
 class LotteryModelV3:
-    """双色球预测模型 v3.1"""
+    """双色球预测模型 v3.3 — 冷热双策略"""
 
     def __init__(self):
         self.df_history = None
@@ -890,98 +1021,55 @@ class LotteryModelV3:
         }
 
     # ------------------------------------------------------------------
-    # v3.2: 六组差异化多样性预测 (真多样性)
+    # v3.3: 冷号追踪策略 (ML Model — 追冷号回补)
     # ------------------------------------------------------------------
 
-    def predict_multi(self, date_val, hour=21, n=6):
+    def predict_cold_strategy(self, date_val, hour=21):
         """
-        v3.2: 6组差异化预测 (真多样性 — 不同组使用不同特征权重策略)
-        组1: 基准(自适应区域平衡) — freq_multiplier=1.0
-        组2: 追冷号 — freq_multiplier=0.3 (抑制高频特征, 冷号获更高分)
-        组3: 追热号 — freq_multiplier=3.0 (放大频率特征, 热号获更高分)
-        组4: 均衡分散(2-2-2) — freq_multiplier=1.0 + 每区2个
-        组5: 五行偏重 — 根据日主五行偏好调整权重
-        组6: 加权随机采样 — freq_multiplier=2.0 从 Top-15 随机
+        v3.3 冷号追踪策略: 基于 RF 模型，4 个频率特征主导 (84.2% 特征重要性)。
+
+        四组:
+          C1 - 基准ML: 原始 RF + 趋势权重 + 自适应区域平衡
+          C2 - 追冷号: freq_multiplier=0.3, 抑制频率特征让冷号得分更高
+          C3 - 八字五行偏重: freq_multiplier=1.0 + 补益五行 +8%
+          C4 - 冷号加权随机: 从 Top-15 (追冷偏好) 加权随机采样
+
+        Returns:
+            dict: {'strategy': 'cold', 'groups': [...], 'base_prediction': {...}}
         """
-        # 组1: 基准
         base = self.predict(date_val, hour)
-        scores = base['red_scores']
         full_scores, _ = self._predict_red_scores(date_val, hour, freq_multiplier=1.0)
         full_scores_dict = {n: s for n, s in full_scores}
 
-        results = [{
-            'date': date_val,
-            'index': 1,
+        groups = []
+
+        # --- C1: 基准ML ---
+        groups.append({
+            'index': 'C1',
             'pred_red': base['pred_red'],
             'pred_blue': base['pred_blue'],
-            'strategy': '基准(自适应区域平衡)',
-        }]
+            'strategy': '基准ML(自适应区域平衡)',
+            'rationale': '原始RF模型+趋势权重+自适应分区约束',
+        })
 
-        # --- 组2: 追冷号 (抑制频率, 冷号获更多分) ---
+        # --- C2: 追冷号 ---
         cold_scores, _ = self._predict_red_scores(date_val, hour, freq_multiplier=0.3)
-        cold_full = {n: s for n, s in cold_scores}
-
-        # 选出冷号高分中的 Top-6 (自适应区域约束)
         cold_top6 = self._balanced_top6(cold_scores, adaptive=True)
 
-        # 蓝球: CLF 第二选择
         blue_proba = base.get('blue_proba_top5', [])
-        blue2 = blue_proba[1][0] if len(blue_proba) > 1 else base['pred_blue']
+        blue_c2 = blue_proba[1][0] if len(blue_proba) > 1 else base['pred_blue']
 
-        results.append({
-            'date': date_val,
-            'index': 2,
+        groups.append({
+            'index': 'C2',
             'pred_red': cold_top6,
-            'pred_blue': blue2,
+            'pred_blue': blue_c2,
             'strategy': '追冷号(freq×0.3)',
+            'rationale': '抑制频率特征权重→冷号得分更高; 蓝球跳过CLF argmax避免重号偏见',
         })
 
-        # --- 组3: 追热号 (放大频率特征) ---
-        hot_scores, _ = self._predict_red_scores(date_val, hour, freq_multiplier=3.0)
-        hot_top6 = self._balanced_top6(hot_scores, adaptive=True)
-
-        # 蓝球: CLF argmax
-        blue3 = base['blue_clf_argmax']
-
-        results.append({
-            'date': date_val,
-            'index': 3,
-            'pred_red': hot_top6,
-            'pred_blue': int(blue3),
-            'strategy': '追热号(freq×3.0)',
-        })
-
-        # --- 组4: 均衡分散 (每区恰好2个) ---
-        selected4 = set()
-        for z in [1, 2, 3]:
-            z_nums = ZONE1 if z == 1 else ZONE2 if z == 2 else ZONE3
-            z_list = [(n, s) for n, s in full_scores if n in z_nums and n not in selected4]
-            count = 0
-            for n, s in z_list:
-                if count >= 2:
-                    break
-                selected4.add(n)
-                count += 1
-
-        # 蓝球: AR 离散预测
-        if len(self.df_history) > 0:
-            last_blue = self.df_history['blue'].iloc[-1]
-        else:
-            last_blue = 8
-        blue4 = self.model_blue_ar.predict_discrete(last_blue)
-
-        results.append({
-            'date': date_val,
-            'index': 4,
-            'pred_red': sorted(selected4),
-            'pred_blue': blue4,
-            'strategy': '均衡分散(2-2-2)',
-        })
-
-        # --- 组5: 五行偏重 — 根据日主五行调整 ---
+        # --- C3: 八字五行偏重 ---
         feat, _, _ = extract_features_enhanced(date_val, hour)
-        rizhu_wx = TG_WX[feat['rizhu_gan']]  # 日主五行
-        # 五行补益: 生我 + 我 → 加温
+        rizhu_wx = TG_WX[feat['rizhu_gan']]
         wx_boost = {'木': ['水', '木'], '火': ['木', '火'], '土': ['火', '土'],
                     '金': ['土', '金'], '水': ['金', '水']}
         boost_wx = wx_boost.get(rizhu_wx, ['木', '火'])
@@ -991,62 +1079,235 @@ class LotteryModelV3:
         for n, s in wx_scores:
             n_wx = TG_WX[_number_tiangan(n)]
             if n_wx in boost_wx:
-                s *= 1.08  # 补益五行加温 8%
+                s *= 1.08
             wx_adjusted.append((n, s))
         wx_adjusted.sort(key=lambda t: t[1], reverse=True)
         wx_top6 = self._balanced_top6(wx_adjusted, adaptive=True)
 
-        # 蓝球: 从概率分布中按期望取
-        blue5 = int(round(base['blue_clf_expected']))
+        blue_c3 = int(round(base['blue_clf_expected']))
 
-        results.append({
-            'date': date_val,
-            'index': 5,
+        groups.append({
+            'index': 'C3',
             'pred_red': wx_top6,
-            'pred_blue': blue5,
-            'strategy': f'五行偏重(喜{"/".join(boost_wx)})',
+            'pred_blue': blue_c3,
+            'strategy': f'八字五行偏重(喜{"/".join(boost_wx)})',
+            'rationale': '补益日主五行号码+8%→唯一有八字信号的组',
         })
 
-        # --- 组6: 加权随机采样 ---
-        np.random.seed(int(date_val.strftime('%Y%m%d')) + 5)
-        top15_nums = [n for n, _ in full_scores[:15]]
-        top15_probs = np.array([s for _, s in full_scores[:15]])
-        top15_probs = top15_probs / top15_probs.sum()
-        sampled = set()
-        # 分区约束的加权采样
+        # --- C4: 冷号加权随机 ---
+        np.random.seed(int(date_val.strftime('%Y%m%d')) + 3)
+        cold_scored, _ = self._predict_red_scores(date_val, hour, freq_multiplier=0.3)
+        cold_top15 = [n for n, _ in cold_scored[:15]]
+        cold_top15_probs = np.array([s for _, s in cold_scored[:15]])
+        cold_top15_probs = np.clip(cold_top15_probs, 0, None)
+        if cold_top15_probs.sum() > 0:
+            cold_top15_probs = cold_top15_probs / cold_top15_probs.sum()
+
+        sampled_c4 = set()
         for z_nums, z_want in [(ZONE1, 2), (ZONE2, 2), (ZONE3, 2)]:
-            z_candidates = [n for n in top15_nums if n in z_nums and n not in sampled]
-            if z_candidates:
-                z_probs = np.array([full_scores_dict[n] for n in z_candidates])
-                z_probs = z_probs / z_probs.sum()
-                picks = np.random.choice(z_candidates, size=min(z_want, len(z_candidates)),
-                                        replace=False, p=z_probs)
-                sampled.update(picks)
-        # 不够 6 个从剩余补
-        for n, _ in full_scores:
-            if len(sampled) >= 6:
+            z_c = [n for n in cold_top15 if n in z_nums and n not in sampled_c4]
+            if z_c:
+                z_p = np.array([dict(cold_scored).get(n, 0.01) for n in z_c])
+                z_p = np.clip(z_p, 0, None)
+                if z_p.sum() > 0:
+                    z_p = z_p / z_p.sum()
+                else:
+                    z_p = None
+                picks = np.random.choice(z_c, size=min(z_want, len(z_c)),
+                                        replace=False, p=z_p)
+                sampled_c4.update(picks)
+        for n, _ in cold_scored:
+            if len(sampled_c4) >= 6:
                 break
-            if n not in sampled:
-                sampled.add(n)
+            if n not in sampled_c4:
+                sampled_c4.add(n)
 
-        # 蓝球: 随机采样
         if blue_proba:
-            b_nums = [b[0] for b in blue_proba[:5]]
-            b_probs = np.array([b[1] for b in blue_proba[:5]])
-            b_probs = b_probs / b_probs.sum()
-            blue6 = int(np.random.choice(b_nums, p=b_probs))
+            b_nums_c4 = [b[0] for b in blue_proba[:5]]
+            b_probs_c4 = np.array([b[1] for b in blue_proba[:5]])
+            b_probs_c4 = b_probs_c4 / b_probs_c4.sum()
+            blue_c4 = int(np.random.choice(b_nums_c4, p=b_probs_c4))
         else:
-            blue6 = base['pred_blue']
+            blue_c4 = base['pred_blue']
 
-        results.append({
-            'date': date_val,
-            'index': 6,
-            'pred_red': sorted(sampled),
-            'pred_blue': blue6,
-            'strategy': '加权随机采样',
+        groups.append({
+            'index': 'C4',
+            'pred_red': sorted(sampled_c4),
+            'pred_blue': blue_c4,
+            'strategy': '冷号加权随机',
+            'rationale': '从追冷Top-15分区加权随机采样→引入随机性',
         })
 
-        return results, base
+        return {
+            'strategy': 'cold',
+            'label': '🔵 冷号追踪策略 (ML Model — 追冷号回补)',
+            'groups': groups,
+            'base_prediction': base,
+            'wuxing_boost': boost_wx,
+        }
+
+    # ------------------------------------------------------------------
+    # v3.3: 热号动量策略 (Frequency Momentum — 追热号延续)
+    # ------------------------------------------------------------------
+
+    def predict_hot_strategy(self, date_val, hour=21):
+        """
+        v3.3 热号动量策略: 纯频率统计，完全不使用 ML 模型。
+
+        四组:
+          H1 - 纯热度动量(2-2-2): 纯频率评分 + 每区2个
+          H2 - 近期爆发(近3期×5): surge变体, 近3期出现权重×5
+          H3 - 热区聚焦: 识别最热分区, 热区3个+其余区1-2个
+          H4 - 混合加权(70%频率+30%RF): 频率主导, RF微调
+
+        Returns:
+            dict: {'strategy': 'hot', 'groups': [...], 'freq_stats': {...}}
+        """
+        if self.df_history is None or len(self.df_history) == 0:
+            raise ValueError('No history data loaded')
+
+        # 计算频率统计
+        freq_counts = _compute_number_frequency_counts(self.df_history)
+
+        # 获取 RF 分数用于 H4
+        base = self.predict(date_val, hour)
+        rf_scores = base['red_raw_scores']  # dict {n: raw_prob}
+
+        # 蓝球频率统计
+        blue_freq = {}
+        n_total = len(self.df_history)
+        for b in range(1, 17):
+            blue_freq[b] = {
+                'count5': sum(1 for j in range(max(0, n_total - 5), n_total)
+                             if int(self.df_history.iloc[j]['blue']) == b),
+                'count10': sum(1 for j in range(max(0, n_total - 10), n_total)
+                              if int(self.df_history.iloc[j]['blue']) == b),
+            }
+
+        # 蓝球基础值
+        if len(self.df_history) > 0:
+            last_blue = self.df_history['blue'].iloc[-1]
+        else:
+            last_blue = 8
+
+        groups = []
+
+        # --- H1: 纯热度动量 (2-2-2) ---
+        hot_scores_default = _compute_hot_momentum_scores(freq_counts, variant='default')
+        h1_red = _zone_pick_from_scored(hot_scores_default, picks_per_zone=(2, 2, 2),
+                                        adaptive=False, n_total=6)
+
+        # 蓝球: 近10期最频繁
+        blue_h1 = max(range(1, 17), key=lambda b: blue_freq[b]['count10'])
+
+        groups.append({
+            'index': 'H1',
+            'pred_red': h1_red,
+            'pred_blue': blue_h1,
+            'strategy': '纯热度动量(2-2-2)',
+            'rationale': f'纯频率统计(count3×3+count5×1.5+count10×0.5), 每区2个; 蓝球=近10期最频({blue_h1})',
+        })
+
+        # --- H2: 近期爆发 (surge) ---
+        hot_scores_surge = _compute_hot_momentum_scores(freq_counts, variant='surge')
+        h2_red = _zone_pick_from_scored(hot_scores_surge, picks_per_zone=(1, 1, 1),
+                                        adaptive=True, n_total=6)
+
+        # 蓝球: 近5期最频繁
+        blue_h2 = max(range(1, 17), key=lambda b: blue_freq[b]['count5'])
+
+        groups.append({
+            'index': 'H2',
+            'pred_red': h2_red,
+            'pred_blue': blue_h2,
+            'strategy': '近期爆发(近3期×5)',
+            'rationale': f'近3期出现权重×5, 自适应区域约束; 蓝球=近5期最频({blue_h2})',
+        })
+
+        # --- H3: 热区聚焦 ---
+        # 识别最热分区 (近5期出现最多号码的分区)
+        zone_hotness = {1: 0, 2: 0, 3: 0}
+        for n, fc in freq_counts.items():
+            if 1 <= n <= 11:
+                z = 1
+            elif 12 <= n <= 22:
+                z = 2
+            else:
+                z = 3
+            zone_hotness[z] += fc['count5']
+        hottest_zone = max(zone_hotness, key=zone_hotness.get)
+
+        # 热区3个 + 其余区1+2 或 2+1
+        zone_picks = [0, 0, 0]
+        zone_picks[hottest_zone - 1] = 3
+        remaining = [z for z in [1, 2, 3] if z != hottest_zone]
+        zone_picks[remaining[0] - 1] = 2
+        zone_picks[remaining[1] - 1] = 1
+        h3_red = _zone_pick_from_scored(hot_scores_default,
+                                        picks_per_zone=tuple(zone_picks),
+                                        adaptive=False, n_total=6)
+
+        # 蓝球: AR 离散
+        blue_h3 = self.model_blue_ar.predict_discrete(last_blue)
+
+        groups.append({
+            'index': 'H3',
+            'pred_red': h3_red,
+            'pred_blue': blue_h3,
+            'strategy': f'热区聚焦({hottest_zone}区×3)',
+            'rationale': f'{hottest_zone}区近5期最活跃, 分配3个名额; 蓝球=AR离散({blue_h3})',
+        })
+
+        # --- H4: 混合加权 (70%频率 + 30%RF) ---
+        max_hot = max(s for _, s in hot_scores_default)
+        max_rf = max(rf_scores.values())
+
+        mixed_scores = []
+        for n in range(1, 34):
+            hot_norm = dict(hot_scores_default).get(n, 0) / max_hot if max_hot > 0 else 0
+            rf_norm = rf_scores.get(n, 0) / max_rf if max_rf > 0 else 0
+            mixed = 0.70 * hot_norm + 0.30 * rf_norm
+            mixed_scores.append((n, mixed))
+        mixed_scores.sort(key=lambda t: t[1], reverse=True)
+        h4_red = _zone_pick_from_scored(mixed_scores, picks_per_zone=(2, 2, 2),
+                                        adaptive=False, n_total=6)
+
+        # 蓝球: 30% CLF + 70% AR (逆向权重)
+        blue_clf_exp = base['blue_clf_expected']
+        blue_ar_val = base['blue_ar']
+        blue_h4 = int(round(np.clip(0.30 * blue_clf_exp + 0.70 * blue_ar_val, 1, 16)))
+
+        groups.append({
+            'index': 'H4',
+            'pred_red': h4_red,
+            'pred_blue': blue_h4,
+            'strategy': '混合加权(70%热度+30%RF)',
+            'rationale': '频率主导(70%)+RF八字微调(30%); 蓝球=30%CLF+70%AR',
+        })
+
+        return {
+            'strategy': 'hot',
+            'label': '🔴 热号动量策略 (Frequency Momentum — 追热号延续)',
+            'groups': groups,
+            'freq_stats': freq_counts,
+            'blue_freq': blue_freq,
+            'hottest_zone': hottest_zone,
+        }
+
+    # ------------------------------------------------------------------
+    # v3.3: 双策略调度器
+    # ------------------------------------------------------------------
+
+    def predict_multi(self, date_val, hour=21):
+        """
+        v3.3 双策略预测: 同时输出冷号追踪(ML)和热号动量(频率)两种相反策略。
+
+        Returns:
+            (cold_result, hot_result) — 每个都是带有 'groups' 列表的 dict
+        """
+        cold_result = self.predict_cold_strategy(date_val, hour)
+        hot_result = self.predict_hot_strategy(date_val, hour)
+        return cold_result, hot_result
 
     # ------------------------------------------------------------------
     # 辅助
@@ -1076,8 +1337,8 @@ class LotteryModelV3:
 
 if __name__ == '__main__':
     print('=' * 60)
-    print('双色球预测模型 v3.2')
-    print('多周期频率 + 趋势权重 + 双窗口AR + 自适应区域 + 连号奖励')
+    print('双色球预测模型 v3.3 — 冷热双策略')
+    print('冷号追踪(ML RF) + 热号动量(纯频率统计)')
     print('=' * 60)
 
     model = LotteryModelV3()
